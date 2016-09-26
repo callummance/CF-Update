@@ -22,7 +22,7 @@ def getMyIp():
 def getConfig():
 	config = configparser.ConfigParser()
 	if len(sys.argv) == 1:
-		config.read('/etc/cf.conf')
+		config.read('/etc/cf-update/cf.conf')
 	else:
 		config.read(sys.argv[1])
 	if not "CloudFlare_Settings" in config:
