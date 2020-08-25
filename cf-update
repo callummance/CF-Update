@@ -1,142 +1,132 @@
 #!/usr/bin/python3
 
-import urllib.parse
-import urllib.request
+import requests
 
 import json
-import configparser
-import sys
+import configparser  # useful for .conf files
+import sys, os  # sys for die(), os for XDG support
 
 IPECHO_URL = "http://ipecho.net/plain"
-CFAPI_URL = "https://api.cloudflare.com/client/v4"
+BASE_API_URL = "https://api.cloudflare.com/client/v4"
+DEFAULT_CONFIG_PATH = os.environ['XDG_CONFIG_DIRS']+"/cf-update/cf.conf"
 
-def die(s):
-	print(s, file=sys.stderr)
+def die(*s):
+	print(*s, file=sys.stderr)
 	sys.exit(-1)
 
-def getMyIp():
-	req = urllib.request.urlopen(IPECHO_URL)
-	res = req.read().decode('utf-8')
-	return res
+class ConfigHandler:
+	def __init__(self, filename=None):
+		config = configparser.ConfigParser()
 
-def getConfig():
-	config = configparser.ConfigParser()
-	if len(sys.argv) == 1:
-		config.read('/etc/cf-update/cf.conf')
-	else:
-		config.read(sys.argv[1])
-	if not "CloudFlare_Settings" in config:
-		print("Config file does not have a CloudFlare_Settings section.")
-		sys.exit(-1)
-	elif not "Hostname_Settings" in config:
-		print("Config file does not have a Hostname_Settings section.")
-		sys.exit(-1)
-	else:
-		return config
+		try:
+			print("Looking for config file...")
+			if not filename:
+				if len(sys.argv) > 1:  # argv includes filename as [0]
+					filename = sys.argv[1]
+				else:
+					filename = DEFAULT_CONFIG_PATH
 
-class cfapiconn:
-	def __init__(self, email, key):
-		self.email = email
-		self.key = key
+			print("Using config file at ", filename)
+			config.read(filename)
+		except:
+			die('Failed to find the config file')
 
-	def authReq(self, req):
-		req.add_header('X-Auth-Email', bytes(self.email, 'utf-8'))
-		req.add_header('X-Auth-Key', bytes(self.key, 'utf-8'))
-		req.add_header('Content-Type', bytes('application/json', 'utf-8'))
+		try:
+			self.cf_email = config['CloudFlare']['email']
+			self.cf_token = config['CloudFlare']['token']
+			self.domain = config['Hostname']['domain']
+			self.hostname = config['Hostname']['hostname']
+		except:
+			die('Config file is corrupted.')
 
-	def getZoneId(self, domain):
-		url = CFAPI_URL + "/zones"
+	@staticmethod
+	def get_public_ip():
+		""" Basically a curl request """
+		ip_request = requests.get(IPECHO_URL)
+		return ip_request.text
+
+
+class CloudFlareAPIConnection:
+	def __init__(self, config):
+		self.cfg = config
+		self.auth_headers =  {
+			'X-Auth-Email': self.cfg.cf_email,
+			'Authorization': "Bearer {}".format(self.cfg.cf_token),
+			'Content-Type': 'application/json'
+		}
+		print("Found headers: ", self.auth_headers)
+
+	def update(self):
+		print("Getting zone id...")
+		zone_id = self.get_zone_id(self.cfg.domain)
+
+		print("Getting records...")
+		records = self.get_records(zone_id)
+
+		print("Selecting record...")
+		record = self.find_hostname_record(records, self.cfg.hostname)
+
+		print("Getting new IP address...")
+		new_ip = ConfigHandler.get_public_ip()
+
+		print("Found record ", record, "in between", len(records), "records at zone", zone_id)
+		print("Using IP", new_ip)
+
+		self.renew_record(record, new_ip)
+		print("Done!")
+
+	def get_zone_id(self, domain):
+		zones_url = BASE_API_URL + "/zones"
 		data = {'name': domain}
 
-		req = urllib.request.Request(url + '?' + urllib.parse.urlencode(data))
+		response = requests.get(zones_url, params=data, headers=self.auth_headers)
+		response_json = response.json()
 
-		self.authReq(req)
+		try:
+			result = response_json['result']
+			zone_id = result[0]['id']  # taking first, and hopefully only, zone_id
+		except:
+			die("Could not get zone_id: ",  response_json)
 
-		resp = urllib.request.urlopen(req)
-		rawres = resp.read().decode('utf-8')
+		return zone_id
 
-		resstruct = json.loads(rawres)
+	def get_records(self, zone_id):
+		url = BASE_API_URL + "/zones/" + zone_id + "/dns_records"
 
-		if not resstruct['success']:
-			die("Lookup domain lookup failed: " + rawres)
-		else:
-			result = resstruct['result']
-			resid = result[0]['id']
+		response = requests.get(url, headers=self.auth_headers)
+		response_json = response.json()
 
-		return resid
+		try:
+			return response_json['result']
+		except:
+			die("Could not get records in zone: ", response_json)
 
-	def getDnsRecords(self, domain):
-		zoneId = self.getZoneId(domain)
-		url = CFAPI_URL + "/zones/" + zoneId + "/dns_records"
 
-		req = urllib.request.Request(url)
-		self.authReq(req)
-
-		resp = urllib.request.urlopen(req)
-		rawres = resp.read().decode('utf-8')
-
-		resstruct = json.loads(rawres)
-
-		if not resstruct['success']:
-			die("Lookup domain lookup failed: " + rawres)
-		else:
-			result = resstruct['result']
-
-		return result
-
-	def getRecord(self, domain, hostname):
-		records = self.getDnsRecords(domain)
-		res = ""
+	def find_hostname_record(self, records, hostname):
 		for record in records:
+			# print(json.dumps(record, indent=2))
 			if record['name'] == hostname:
-				res = record
-				break
+				return record
 
-		if res == "":
-			return "None"
-		else:
-			return res
+	def renew_record(self, record, new_ip):
+		assert record is not None
 
-	def updateRecord(self, record, newip):
-		if record == "None":
-			return False
-
-		url = CFAPI_URL + "/zones/" + record['zone_id'] + "/dns_records/" + record['id']
+		url = BASE_API_URL + "/zones/" + record['zone_id'] + "/dns_records/" + record['id']
 		data = record
-		data['content'] = newip
+		data['content'] = new_ip
 		reqdata = bytes(json.dumps(data), 'utf-8')
 
-		req = urllib.request.Request(url=url,
-			data=reqdata,
-			method='PUT')
+		response = requests.put(url, params=reqdata, headers=self.auth_headers)
+		response_json = response.json()
 
-		self.authReq(req)
-
-		resp = urllib.request.urlopen(req)
-		rawres = resp.read().decode('utf-8')
-
-		resstruct = json.loads(rawres)
-
-		if not resstruct['success']:
-			die("Could not update DNS record, failed with error: " + rawres)
-		else:
-			result = resstruct['result']
-
-		return result
-
-
-
-
-
+		try:
+			return response_json['result']
+		except:
+			die("Could not update DNS record, failed with error: " + response_json)
 
 
 if __name__ == "__main__":
-	config = getConfig()
-	cfConfig = config['CloudFlare_Settings']
-	apiConn = cfapiconn(cfConfig['Email'], cfConfig['API_Key'])
-
-	domConfig = config['Hostname_Settings']
-	record = apiConn.getRecord(domConfig['Domain'], domConfig['Hostname'])
-
-	newip = getMyIp()
-	print(apiConn.updateRecord(record, newip))
+	config = ConfigHandler()
+	api_conn = CloudFlareAPIConnection(config)
+	api_conn.update()
+	
